@@ -1,0 +1,562 @@
+项目 'kimi-ai-2api' 的结构树:
+📂 kimi-ai-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 kimi_ai_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# [自动填充] kimi-ai-2api 生产环境配置
+# 该文件由 Project Chimera 自动生成，可直接用于一键部署。
+
+# --- 安全配置 ---
+# 用于保护您的 API 服务的访问密钥，请按需修改为您自己的复杂密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- 会话管理 ---
+# 对话历史在内存中的缓存时间（秒），默认1小时
+SESSION_CACHE_TTL=3600
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# kimi-ai-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-kimi-ai-2api-default-key-please-change-me
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+# --- 会话管理 (可选) ---
+# 对话历史在内存中的缓存时间（秒），默认1小时
+SESSION_CACHE_TTL=3600
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for kimi-ai-2api (v1.0 - Genesis Edition)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装系统依赖 (cloudscraper 可能需要)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动 (使用多个 worker 以处理并发请求)
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: kimi-ai-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - kimi-ai-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kimi-ai-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - kimi-ai-net
+
+networks:
+  kimi-ai-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.core.config import settings
+from app.providers.kimi_ai_provider import KimiAIProvider
+
+# --- 日志配置 ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- 全局 Provider 实例 ---
+provider: Optional[KimiAIProvider] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global provider
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    provider = KimiAIProvider()
+    await provider.initialize()
+    logger.info("服务已进入 'Cloudscraper & Stateful Context' 模式。")
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+# --- 安全依赖 ---
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+# --- API 路由 ---
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request) -> StreamingResponse:
+    try:
+        request_data = await request.json()
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream kimi_ai_backend {
+        # 关键：使用 ip_hash 确保来自同一客户端的请求被转发到同一个 worker,
+        # 这对于保持内存中会话上下文的连续性至关重要。
+        ip_hash;
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://kimi_ai_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 流式传输优化
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+cloudscraper
+cachetools
+httpx
+loguru
+beautifulsoup4
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "kimi-ai-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 kimi-ai.chat 转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    API_MASTER_KEY: Optional[str] = None
+    
+    API_REQUEST_TIMEOUT: int = 180
+    NGINX_PORT: int = 8088
+    SESSION_CACHE_TTL: int = 3600
+
+    KNOWN_MODELS: List[str] = ["kimi-k2-instruct-0905", "kimi-k2-instruct"]
+    DEFAULT_MODEL: str = "kimi-k2-instruct-0905"
+    
+    UPSTREAM_URL: str = "https://kimi-ai.chat/wp-admin/admin-ajax.php"
+    CHAT_PAGE_URL: str = "https://kimi-ai.chat/chat/"
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\kimi_ai_provider.py ---
+
+import json
+import time
+import uuid
+import random
+import string
+import re
+import asyncio
+from typing import Dict, Any, AsyncGenerator, Optional, List
+
+import cloudscraper
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+from cachetools import TTLCache
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+class KimiAIProvider(BaseProvider):
+    def __init__(self):
+        self.scraper = cloudscraper.create_scraper()
+        # 缓存结构: { "user_key": {"kimi_session_id": "...", "messages": [...] } }
+        self.session_cache = TTLCache(maxsize=1024, ttl=settings.SESSION_CACHE_TTL)
+        self._nonce: Optional[str] = None
+        self._nonce_lock = asyncio.Lock()
+
+    async def initialize(self):
+        """在服务启动时预取一次 nonce。"""
+        logger.info("正在初始化 KimiAIProvider，首次获取 nonce...")
+        await self._get_nonce()
+
+    async def _fetch_nonce(self) -> str:
+        """从聊天页面抓取动态的 nonce 值。"""
+        try:
+            logger.info("正在从上游页面抓取新的 nonce...")
+            response = self.scraper.get(settings.CHAT_PAGE_URL, timeout=20)
+            response.raise_for_status()
+            html_content = response.text
+
+            match = re.search(r'var kimi_ajax = ({.*?});', html_content)
+            if not match:
+                raise ValueError("在页面 HTML 中未找到 'kimi_ajax' JS 变量。")
+
+            ajax_data = json.loads(match.group(1))
+            nonce = ajax_data.get("nonce")
+            if not nonce:
+                raise ValueError("'kimi_ajax' 对象中缺少 'nonce' 字段。")
+            
+            logger.success(f"成功抓取到新的 nonce: {nonce}")
+            return nonce
+        except Exception as e:
+            logger.error(f"抓取 nonce 失败: {e}", exc_info=True)
+            raise HTTPException(status_code=503, detail=f"无法从上游服务获取必要的动态参数: {e}")
+
+    async def _get_nonce(self, force_refresh: bool = False) -> str:
+        """获取并缓存 nonce，处理并发请求和刷新逻辑。"""
+        async with self._nonce_lock:
+            if self._nonce is None or force_refresh:
+                self._nonce = await self._fetch_nonce()
+            return self._nonce
+
+    def _get_or_create_session(self, user_key: str) -> Dict[str, Any]:
+        """为用户获取或创建一个新的会话对象。"""
+        if user_key in self.session_cache:
+            return self.session_cache[user_key]
+        
+        timestamp = int(time.time() * 1000)
+        random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=9))
+        new_session_id = f"session_{timestamp}_{random_str}"
+        
+        new_session = {
+            "kimi_session_id": new_session_id,
+            "messages": []
+        }
+        self.session_cache[user_key] = new_session
+        logger.info(f"为用户 '{user_key}' 创建了新的会话: {new_session_id}")
+        return new_session
+
+    def _build_contextual_prompt(self, history: List[Dict[str, str]], new_message: str) -> str:
+        """
+        将历史记录和新消息拼接成一个单一的字符串，并根据需要截断以满足1000字符的限制。
+        """
+        # 格式化历史记录为 "角色: 内容" 的形式
+        history_lines = []
+        for msg in history:
+            role = "用户" if msg.get("role") == "user" else "模型"
+            history_lines.append(f"{role}: {msg.get('content', '')}")
+        
+        history_str = "\n".join(history_lines)
+        
+        # 初始完整上下文
+        full_prompt = f"{history_str}\n用户: {new_message}".strip()
+
+        # 智能截断逻辑：如果超出长度，从头开始移除一轮对话（用户+模型）
+        while len(full_prompt) > settings.CONTEXT_MAX_LENGTH and history:
+            logger.warning(f"上下文超长 ({len(full_prompt)} > {settings.CONTEXT_MAX_LENGTH})，正在从头部截断...")
+            # 移除最早的一条用户消息
+            history.pop(0) 
+            # 如果还有消息，再移除一条对应的模型消息
+            if history:
+                history.pop(0)
+            
+            history_lines = []
+            for msg in history:
+                role = "用户" if msg.get("role") == "user" else "模型"
+                history_lines.append(f"{role}: {msg.get('content', '')}")
+            history_str = "\n".join(history_lines)
+            full_prompt = f"{history_str}\n用户: {new_message}".strip()
+        
+        return full_prompt
+
+    async def chat_completion(self, request_data: Dict[str, Any]) -> StreamingResponse:
+        user_key = request_data.get("user")
+        
+        messages = request_data.get("messages", [])
+        if not messages or messages[-1].get("role") != "user":
+            raise HTTPException(status_code=400, detail="'messages' 列表不能为空，且最后一条必须是 user 角色。")
+
+        current_user_message = messages[-1]
+        
+        # 根据是否存在 user_key 决定工作模式
+        if user_key:
+            # --- 有状态模式 ---
+            logger.info(f"检测到 'user' 字段，进入有状态模式。用户: {user_key}")
+            session_data = self._get_or_create_session(user_key)
+            prompt_to_send = self._build_contextual_prompt(session_data["messages"], current_user_message["content"])
+            kimi_session_id = session_data["kimi_session_id"]
+        else:
+            # --- 无状态模式 ---
+            logger.info("未检测到 'user' 字段，进入无状态模式。")
+            session_data = None # 无状态模式下没有会话数据
+            prompt_to_send = current_user_message["content"]
+            # 为无状态请求生成一次性的 session_id
+            timestamp = int(time.time() * 1000)
+            random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=9))
+            kimi_session_id = f"session_{timestamp}_{random_str}"
+
+        async def stream_generator() -> AsyncGenerator[bytes, None]:
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            model = request_data.get("model", settings.DEFAULT_MODEL)
+            
+            try:
+                nonce = await self._get_nonce()
+                payload = self._prepare_payload(prompt_to_send, model, kimi_session_id, nonce)
+                
+                logger.info(f"向上游发送请求, Session ID: {kimi_session_id}, 模型: {payload['model']}")
+                logger.debug(f"发送的完整 Prompt: {prompt_to_send}")
+                
+                response = self.scraper.post(settings.UPSTREAM_URL, data=payload, timeout=settings.API_REQUEST_TIMEOUT)
+                response.raise_for_status()
+                
+                response_data = response.json()
+                if not response_data.get("success"):
+                    error_message = response_data.get("data", "未知错误")
+                    logger.warning(f"上游请求失败: {error_message}。可能 nonce 失效，正在尝试刷新并重试...")
+                    
+                    nonce = await self._get_nonce(force_refresh=True)
+                    payload['nonce'] = nonce
+                    
+                    response = self.scraper.post(settings.UPSTREAM_URL, data=payload, timeout=settings.API_REQUEST_TIMEOUT)
+                    response.raise_for_status()
+                    response_data = response.json()
+
+                    if not response_data.get("success"):
+                         raise HTTPException(status_code=502, detail=f"重试后上游请求依然失败: {response_data.get('data', '未知错误')}")
+
+                assistant_response_content = response_data.get("data", {}).get("message", "")
+                
+                # 如果是有状态模式，则更新服务端会话历史
+                if session_data:
+                    session_data["messages"].append(current_user_message)
+                    session_data["messages"].append({"role": "assistant", "content": assistant_response_content})
+                    self.session_cache[user_key] = session_data
+                    logger.info(f"会话 '{user_key}' 上下文已更新。")
+
+                # 应用【模式：伪流式生成】
+                for char in assistant_response_content:
+                    chunk = create_chat_completion_chunk(request_id, model, char)
+                    yield create_sse_data(chunk)
+                    await asyncio.sleep(0.02)
+
+                final_chunk = create_chat_completion_chunk(request_id, model, "", "stop")
+                yield create_sse_data(final_chunk)
+                yield DONE_CHUNK
+
+            except Exception as e:
+                logger.error(f"处理流时发生错误: {e}", exc_info=True)
+                error_message = f"内部服务器错误: {str(e)}"
+                error_chunk = create_chat_completion_chunk(request_id, model, error_message, "stop")
+                yield create_sse_data(error_chunk)
+                yield DONE_CHUNK
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+    def _prepare_payload(self, prompt: str, model: str, session_id: str, nonce: str) -> Dict[str, Any]:
+        # 映射到上游接受的模型名称
+        if model == "kimi-k2-instruct-0905":
+            upstream_model = "moonshotai/Kimi-K2-Instruct-0905"
+        elif model == "kimi-k2-instruct":
+            upstream_model = "moonshotai/Kimi-K2-Instruct"
+        else:
+            raise HTTPException(status_code=400, detail=f"不支持的模型: {model}")
+
+        return {
+            "action": "kimi_send_message",
+            "nonce": nonce,
+            "message": prompt,
+            "model": upstream_model,
+            "session_id": session_id
+        }
+
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    创建一个与 OpenAI 兼容的聊天补全流式块。
+    """
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+
