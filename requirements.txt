@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+cloudscraper
+cachetools
+httpx
+loguru
+beautifulsoup4
